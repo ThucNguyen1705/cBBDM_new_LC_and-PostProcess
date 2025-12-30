@@ -28,9 +28,11 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
             # - use_onehot: sharper semantics (hard class separation)
             # - use_boundary: add boundary/edge cue from LC label map
             # - use_dual_marm: add MARM branch for raw SAR + fusion layer
+            # - use_edge_map: add edge/skeleton map extracted from LC as additional guidance
             self.lc_use_onehot = bool(getattr(model_config.CondStageParams, 'use_onehot', False))
             self.lc_use_boundary = bool(getattr(model_config.CondStageParams, 'use_boundary', False))
             self.use_dual_marm = bool(getattr(model_config.CondStageParams, 'use_dual_marm', False))
+            self.use_edge_map = bool(getattr(model_config.CondStageParams, 'use_edge_map', False))
 
             # --- LC Branch (MARM_LC) ---
             if self.lc_use_onehot:
@@ -50,6 +52,28 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
             # MARM for LC context
             self.cond_stage_model = MARMConditionModel(**vars(model_config.CondStageParams))
 
+            # --- Edge Map Branch (learns structural boundaries from LC) ---
+            if self.use_edge_map:
+                print("[Edge-Map] Initializing Edge Branch for LC skeleton/boundary learning...")
+                # Edge map is (1, H, W) float -> process with Conv layers to match MARM input
+                edge_embed_dim = self.embed_dim  # Same as LC: 64 channels
+                self.edge_stem = nn.Sequential(
+                    nn.Conv2d(1, 32, kernel_size=3, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(64, edge_embed_dim, kernel_size=3, padding=1),
+                )
+                # Edge MARM: same structure as LC MARM but output to context_out_dim
+                edge_marm_params = {
+                    'in_channels': edge_embed_dim,  # 64
+                    'out_channels': self.context_out_dim,  # 128 (same as LC)
+                    'base_dim': 64,
+                    'n_marms': 2,  # fewer blocks for lighter branch
+                }
+                self.marm_edge = MARMConditionModel(**edge_marm_params)
+                print(f"[Edge-Map] Edge branch: 1 -> {edge_embed_dim} -> {self.context_out_dim}")
+
             # --- SAR Branch (MARM_SAR) + Fusion Layer (Dual-MARM mode) ---
             if self.use_dual_marm:
                 print("[Dual-MARM] Initializing MARM_SAR branch for raw SAR image...")
@@ -61,13 +85,23 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
                     'n_marms': getattr(model_config.CondStageParams, 'n_marms', 4),
                 }
                 self.marm_sar = MARMConditionModel(**sar_marm_params)
+                print(f"[Dual-MARM] SAR MARM: 3 -> {self.context_out_dim}")
 
-                # Fusion Layer: Concat(256) -> Conv1x1 -> ReLU -> (128)
+            # --- Unified Fusion Layer ---
+            # Calculate total input channels for fusion
+            fusion_in_channels = self.context_out_dim  # LC always present (128)
+            if self.use_dual_marm:
+                fusion_in_channels += self.context_out_dim  # SAR MARM output (128)
+            if self.use_edge_map:
+                fusion_in_channels += self.context_out_dim  # Edge MARM output (128)
+            
+            # Only create fusion if we have more than just LC
+            if self.use_dual_marm or self.use_edge_map:
                 self.fusion_proj = nn.Sequential(
-                    nn.Conv2d(self.context_out_dim * 2, self.context_out_dim, kernel_size=1),
+                    nn.Conv2d(fusion_in_channels, self.context_out_dim, kernel_size=1),
                     nn.ReLU(inplace=True),
                 )
-                print(f"[Dual-MARM] Fusion: {self.context_out_dim * 2} -> {self.context_out_dim}")
+                print(f"[Fusion] Combined: {fusion_in_channels} -> {self.context_out_dim}")
         elif self.condition_key == 'SpatialRescaler':
             self.cond_stage_model = SpatialRescaler(**vars(model_config.CondStageParams))
         elif self.condition_key == 'first_stage':
@@ -86,31 +120,38 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
                 parts.append(self.lc_embedding.parameters())
             if getattr(self, 'lc_proj', None) is not None:
                 parts.append(self.lc_proj.parameters())
-            # Dual-MARM: add MARM_SAR and fusion_proj
+            # Dual-MARM: add MARM_SAR
             if getattr(self, 'use_dual_marm', False):
                 parts.append(self.marm_sar.parameters())
+            # Edge-Map branch: add edge_stem and marm_edge
+            if getattr(self, 'use_edge_map', False):
+                parts.append(self.edge_stem.parameters())
+                parts.append(self.marm_edge.parameters())
+            # Fusion layer (if any multi-branch is active)
+            if getattr(self, 'fusion_proj', None) is not None:
                 parts.append(self.fusion_proj.parameters())
             return itertools.chain(*parts)
         elif self.condition_key == 'SpatialRescaler':
             return itertools.chain(self.denoise_fn.parameters(), self.cond_stage_model.parameters())
         return self.denoise_fn.parameters()
 
-    def forward(self, x, x_cond_sar, x_cond_herringbone, context=None):
+    def forward(self, x, x_cond_sar, x_cond_lc, x_cond_edge=None, context=None):
         with torch.no_grad():
             x_latent = self.encode(x, cond=False)
             x_cond_sar_latent = self.encode(x_cond_sar, cond=True)
 
-        # Get fused context (LC + optionally SAR via Dual-MARM)
-        context_guidance = self.get_cond_stage_context(x_cond_herringbone, x_cond_sar)
+        # Get fused context (LC + optionally SAR via Dual-MARM + optionally Edge)
+        context_guidance = self.get_cond_stage_context(x_cond_lc, x_cond_sar, x_cond_edge)
         return super().forward(x_latent.detach(), x_cond_sar_latent.detach(), context=context_guidance)
 
-    def get_cond_stage_context(self, x_cond_lc, x_cond_sar_raw=None):
+    def get_cond_stage_context(self, x_cond_lc, x_cond_sar_raw=None, x_cond_edge=None):
         """
         Compute context for cross-attention.
         
         Args:
             x_cond_lc: LC label map (B, H, W) long tensor
             x_cond_sar_raw: Raw SAR image (B, 3, H, W) float tensor, only used if use_dual_marm=True
+            x_cond_edge: Edge map (B, 1, H, W) float tensor in [0,1], only used if use_edge_map=True
         
         Returns:
             context: (B, context_dim, H', W') tensor for UNet cross-attention
@@ -145,13 +186,30 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
             x_feat = self.lc_stem(x_feat)
             context_lc = self.cond_stage_model(x_feat)  # (B, 128, H', W')
 
-            # --- Dual-MARM: SAR Branch + Fusion ---
+            # Collect all context branches for fusion
+            context_parts = [context_lc]
+
+            # --- Dual-MARM: SAR Branch ---
             if getattr(self, 'use_dual_marm', False) and x_cond_sar_raw is not None:
                 # Normalize SAR from [-1,1] to [0,1] for MARM_SAR (designed for [0,1] input)
                 x_sar_normalized = (x_cond_sar_raw + 1.0) / 2.0
                 context_sar = self.marm_sar(x_sar_normalized)  # (B, 128, H', W')
-                # Concat & Project
-                context_fused = torch.cat([context_sar, context_lc], dim=1)  # (B, 256, H', W')
+                context_parts.append(context_sar)
+
+            # --- Edge-Map Branch ---
+            if getattr(self, 'use_edge_map', False) and x_cond_edge is not None:
+                # x_cond_edge: (B, 1, H, W) float in [0, 1]
+                # Resize to match LC feature map size if needed
+                if x_cond_edge.shape[-2:] != x_cond_lc.shape[-2:]:
+                    x_cond_edge = F.interpolate(x_cond_edge, size=x_cond_lc.shape[-2:], mode='bilinear', align_corners=False)
+                
+                edge_feat = self.edge_stem(x_cond_edge)  # (B, 64, H, W)
+                context_edge = self.marm_edge(edge_feat)  # (B, 128, H', W')
+                context_parts.append(context_edge)
+
+            # --- Fusion ---
+            if len(context_parts) > 1:
+                context_fused = torch.cat(context_parts, dim=1)  # (B, 128+128+128, H', W') or subset
                 context = self.fusion_proj(context_fused)  # (B, 128, H', W')
             else:
                 context = context_lc
@@ -172,7 +230,6 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
             else: x_latent = (x_latent - self.ori_latent_mean) / self.ori_latent_std
         return x_latent
 
-    # Ban hay danh gia phuong phap, neu no tot hon thi ap dung
     @torch.no_grad()
     def decode(self, x_latent, cond=True, normalize=None):
         normalize = self.model_config.normalize_latent if normalize is None else normalize
@@ -184,10 +241,9 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
         return self.vqvae.decode(x_latent_quant)
 
     @torch.no_grad()
-    def sample(self, x_cond_sar, x_cond_herringbone, clip_denoised=False, sample_mid_step=False):
+    def sample(self, x_cond_sar, x_cond_lc, x_cond_edge=None, clip_denoised=False, sample_mid_step=False):
         x_cond_sar_latent = self.encode(x_cond_sar, cond=True)
-        # Pass raw SAR for Dual-MARM fusion
-        context_guidance = self.get_cond_stage_context(x_cond_herringbone, x_cond_sar)
+        context_guidance = self.get_cond_stage_context(x_cond_lc, x_cond_sar, x_cond_edge)
         b, _, h, w = x_cond_sar_latent.shape
         target_shape = (b, 3, h, w) 
         

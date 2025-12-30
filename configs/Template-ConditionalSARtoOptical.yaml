@@ -32,13 +32,13 @@ data:
     # shuffle: False
 
 model:
-  model_name: "LBBDM-LC_3" # part of result path
+  model_name: "LBBDM-LC_4" # part of result path
   model_type: "LBBDM" # specify a module
   latent_before_quant_conv: False
   normalize_latent: False
   only_load_latent_mean_std: False
-  model_load_path:  "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/LBBDM-LC_3/checkpoint/latest_model_2.pth"
-  optim_sche_load_path:  "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/LBBDM-LC_3/checkpoint/latest_optim_sche_2.pth"
+  model_load_path:  "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/LBBDM-LC_4/checkpoint/last_model.pth"
+  optim_sche_load_path:  "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/LBBDM-LC_4/checkpoint/last_optim_sche.pth"
 
   EMA:
     use_ema: True
@@ -57,6 +57,8 @@ model:
     use_boundary: False
     # Dual-MARM: add MARM branch for raw SAR + fusion layer (Concat & Project)
     use_dual_marm: True
+    # Edge-Map: extract skeleton/boundary from LC for better edge learning
+    use_edge_map: True
 
   VQGAN:
     params:

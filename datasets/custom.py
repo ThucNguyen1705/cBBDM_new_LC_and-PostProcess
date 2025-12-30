@@ -71,6 +71,73 @@ def encode_segmentation_rgb(image_tensor: torch.Tensor) -> torch.Tensor:
         label_map[mask] = cls
     return label_map
 
+
+def extract_lc_edges(label_map: torch.Tensor, min_length: int = 20, dilate_size: int = 1) -> torch.Tensor:
+    """
+    Extract boundary edges from LC label map based on CLASS TRANSITIONS.
+    
+    This method focuses on boundaries between different LC classes (color changes),
+    which is more appropriate for semantic segmentation maps than gradient-based methods.
+    
+    Algorithm:
+    1. Detect pixels where neighboring pixels have different class labels
+    2. Create binary boundary map
+    3. Remove small isolated components (noise)
+    4. Optional dilation for visibility
+    
+    Args:
+        label_map: (H, W) long tensor with class labels 0..10
+        min_length: Minimum contour length to keep (removes tiny fragments)
+        dilate_size: Dilation kernel size (0 = no dilation)
+    
+    Returns:
+        edge_map: (1, H, W) float tensor in [0, 1], where 1 = boundary
+    """
+    # Convert to numpy
+    label_np = label_map.cpu().numpy().astype(np.int32)
+    h, w = label_np.shape
+    
+    # Step 1: Detect class transitions (boundaries between different classes)
+    # Check horizontal neighbors (left-right)
+    boundary_h = np.zeros((h, w), dtype=np.uint8)
+    boundary_h[:, 1:] = (label_np[:, 1:] != label_np[:, :-1]).astype(np.uint8)
+    boundary_h[:, :-1] |= (label_np[:, :-1] != label_np[:, 1:]).astype(np.uint8)
+    
+    # Check vertical neighbors (up-down)
+    boundary_v = np.zeros((h, w), dtype=np.uint8)
+    boundary_v[1:, :] = (label_np[1:, :] != label_np[:-1, :]).astype(np.uint8)
+    boundary_v[:-1, :] |= (label_np[:-1, :] != label_np[1:, :]).astype(np.uint8)
+    
+    # Check diagonal neighbors (for smoother boundaries)
+    boundary_d1 = np.zeros((h, w), dtype=np.uint8)
+    boundary_d1[1:, 1:] = (label_np[1:, 1:] != label_np[:-1, :-1]).astype(np.uint8)
+    
+    boundary_d2 = np.zeros((h, w), dtype=np.uint8)
+    boundary_d2[1:, :-1] = (label_np[1:, :-1] != label_np[:-1, 1:]).astype(np.uint8)
+    
+    # Combine all boundaries
+    boundary = (boundary_h | boundary_v | boundary_d1 | boundary_d2).astype(np.uint8)
+    
+    # Step 2: Remove small connected components (keep only long boundaries)
+    if min_length > 0:
+        # Find contours and filter by length
+        contours, _ = cv2.findContours(boundary, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        boundary_filtered = np.zeros_like(boundary)
+        for contour in contours:
+            if len(contour) >= min_length:
+                cv2.drawContours(boundary_filtered, [contour], -1, 1, thickness=1)
+        boundary = boundary_filtered
+    
+    # Step 3: Optional dilation for better visibility
+    if dilate_size > 0:
+        kernel = np.ones((dilate_size * 2 + 1, dilate_size * 2 + 1), np.uint8)
+        boundary = cv2.dilate(boundary, kernel, iterations=1)
+    
+    # Convert back to tensor: (1, H, W) float in [0, 1]
+    edge_tensor = torch.from_numpy(boundary.astype(np.float32)).unsqueeze(0)
+    
+    return edge_tensor
+
 @Registers.datasets.register_with_name('SARtoOptical')
 class CustomAlignedDataset_for_preprov7(Dataset):
     def __init__(self, dataset_config, stage='train'):
@@ -131,7 +198,13 @@ class CustomAlignedDataset_for_preprov7(Dataset):
         # Xử lý: RGB -> Label Index (0-10)
         label_lc = encode_segmentation_rgb(item_cond_c)
         
-        return item_ori, item_cond, label_lc
+        # Extract edge map from LC label map based on class boundaries
+        # min_length=50: Chỉ giữ các đường biên dài (loại bỏ chi tiết nhỏ vụn)
+        # dilate_size=0: Không làm dày thêm (giữ đường mảnh)
+        # edge_map: (1, H, W) float tensor in [0, 1]
+        edge_map = extract_lc_edges(label_lc, min_length=50, dilate_size=0)
+        
+        return item_ori, item_cond, label_lc, edge_map
 
 # --- Các Class khác (Cũng cần sửa thêm [0] nếu dùng) ---
 @Registers.datasets.register_with_name('custom_single')
