@@ -172,7 +172,6 @@ class BrownianBridgeModel(nn.Module):
     def p_sample_loop(self, y, x_T_shape=None, context=None, clip_denoised=False, sample_mid_step=False):
         if self.condition_key == "nocond": context = None
         
-        # y là SAR (3 kênh). img khởi tạo là y (tức là bắt đầu từ ảnh SAR nhiễu)
         img = y
         
         if sample_mid_step:

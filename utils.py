@@ -4,6 +4,7 @@ import omegaconf.dictconfig
 
 from Register import Registers
 from runners.DiffusionBasedModelRunners.BBDMRunner import BBDMRunner
+from runners.DiffusionBasedModelRunners.RefinementRunner import RefinementRunner
 
 
 def dict2namespace(config):

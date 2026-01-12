@@ -1,0 +1,181 @@
+# Phase 2: Texture Refinement Module Configuration
+# Train refinement on top of frozen Phase 1 LBBDM
+# Input: Coarse RGB + SAR Raw + Edge Map -> Refined RGB
+#
+# USAGE:
+# 1. First, pre-generate coarse RGB (run once):
+#    python pre_generate_coarse.py --config configs/Template-Refinement.yaml --split train
+#    python pre_generate_coarse.py --config configs/Template-Refinement.yaml --split val
+#
+# 2. Then train Phase 2 (fast, no diffusion sampling):
+#    python main.py --config configs/Template-Refinement.yaml --train --gpu_ids 0
+
+runner: "RefinementRunner"
+
+training:
+  n_epochs: 50
+  n_steps: 99999999
+  save_interval: 1
+  sample_interval: 1
+  validation_interval: 1
+  accumulate_grad_batches: 1
+  device:
+    - cuda:0
+
+testing:
+  clip_denoised: True
+  sample_num: 1
+
+data:
+  dataset_name: 'dataset_name'
+  dataset_type: 'Phase2Refinement'
+  dataset_config:
+    dataset_path: '/mnt/hdd1tb/Data_Split_Train_Val_Test/'
+    image_size: 256
+    channels: 3
+    to_normal: True
+    flip: True
+  train:
+    batch_size: 8 
+    shuffle: True
+  val:
+    batch_size: 4
+    shuffle: True
+  test:
+    batch_size: 1
+
+model:
+  model_name: "Phase2-TextureRefinement-v2"  
+  model_type: "LBBDM" 
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+  
+  # Phase 1 Model Path (Frozen LBBDM)
+  phase1_model_path: "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/LBBDM-Hierarchical-oneHot_boundary_add_edge/checkpoint/last_model.pth"
+  
+  # Leave empty for Phase 2 training from scratch
+  model_load_path: "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/Phase2-TextureRefinement-v2/checkpoint/last_model.pth"
+  optim_sche_load_path: "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/results/dataset_name/Phase2-TextureRefinement-v2/checkpoint/last_optim_sche.pth"
+  
+  # Loss Configuration
+  # 'advanced' = Charbonnier + SSIM + MultiPerceptual + Gradient + Color
+  # 'simple' = L1 + Perceptual + ColorConsistency (original)
+  loss_type: 'advanced'
+  
+  # Advanced Loss Weights (used when loss_type='advanced')
+  lambda_charbonnier: 1.0   # Smooth L1, good for fine details
+  lambda_ssim: 0.5          # Structural similarity
+  lambda_perceptual: 0.1    # Multi-layer VGG perceptual
+  lambda_gradient: 0.1      # Edge/texture preservation (Sobel)
+  lambda_color: 0.2         # Color histogram matching with GT
+  
+  # Simple Loss Weights (used when loss_type='simple')
+  lambda_l1: 1.0
+  
+  # Refinement Module Config
+  refinement:
+    use_lite: False  # Set True for faster training with smaller model
+    base_dim: 64     # Base dimension (32 for lite, 64 for full)
+    n_marms: 3       # Number of MARM blocks (2 for lite, 3 for full)
+    n_res_blocks: 4  # Number of residual blocks (2 for lite, 4 for full)
+  
+  # Optimizer Config
+  optimizer:
+    weight_decay: 1.e-4
+    optimizer: 'Adam'
+    lr: 1.e-4
+    beta1: 0.9
+  
+  # EMA (optional for refinement)
+  EMA:
+    use_ema: False  # Disable for faster training
+    ema_decay: 0.995
+    update_ema_interval: 8
+    start_ema_step: 10000
+  
+  # Phase 1 LBBDM Config (needed for model loading)
+  CondStageParams:
+    in_channels: 64     
+    out_channels: 128  
+    base_dim: 64        
+    n_marms: 4          
+    num_classes: 11   
+    embed_dim: 64      
+    use_onehot: True
+    use_boundary: True
+    use_hierarchical: True
+    n_marms_hierarchical: 3
+    injection_type: 'add'
+    use_edge_map: True
+
+  VQGAN:
+    params:
+      ckpt_path: '/mnt/hdd1tb/Downloads/vq-f4/model.ckpt'
+      embed_dim: 3
+      n_embed: 8192
+      ddconfig:
+        double_z: false
+        z_channels: 3
+        resolution: 256
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult: !!python/tuple
+          - 1
+          - 2
+          - 4
+        num_res_blocks: 2
+        attn_resolutions: [ ]
+        dropout: 0.2
+      lossconfig:
+        target: torch.nn.Identity
+
+  BB:
+    optimizer:
+      weight_decay: 1.e-4
+      optimizer: 'Adam'
+      lr: 1.e-4
+      beta1: 0.9
+
+    lr_scheduler:
+      factor: 0.5
+      patience: 3000
+      threshold: 0.0001
+      cooldown: 3000
+      min_lr: 5.e-7
+
+    params:
+      mt_type: 'linear'
+      objective: 'grad'
+      loss_type: 'l1'
+      skip_sample: True
+      sample_type: 'linear'
+      sample_step: 200
+      num_timesteps: 1000
+      eta: 1.0
+      max_var: 1.0
+
+      UNetParams:
+        image_size: 64
+        in_channels: 6
+        model_channels: 128
+        out_channels: 3
+        num_res_blocks: 2
+        attention_resolutions: !!python/tuple
+          - 32
+          - 16
+          - 8
+        channel_mult: !!python/tuple
+          - 1
+          - 4
+          - 8
+        conv_resample: True
+        dims: 2
+        num_heads: 8
+        num_head_channels: 64
+        use_scale_shift_norm: True
+        resblock_updown: True
+        use_spatial_transformer: True
+        context_dim: 128     
+        condition_key: "cross_attention"

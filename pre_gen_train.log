@@ -1,0 +1,5 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "/mnt/hdd1tb/Note_Daily/26_12/cBBDM_MARM-main/pre_generate_coarse.py", line 24, in <module>
+    import yaml
+ModuleNotFoundError: No module named 'yaml'

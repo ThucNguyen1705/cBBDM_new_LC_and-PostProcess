@@ -391,3 +391,125 @@ class CustomInpaintingDataset(Dataset):
 
         image_name = Path(img_path).stem
         return (image, image_name), (cond_image, image_name)
+
+
+# =====================================================
+# Phase 2 Refinement Dataset with Pre-generated Coarse RGB
+# =====================================================
+@Registers.datasets.register_with_name('Phase2Refinement')
+class Phase2RefinementDataset(Dataset):
+    """
+    Dataset for Phase 2 Texture Refinement training.
+    
+    Loads pre-generated coarse RGB from disk instead of generating on-the-fly.
+    This dramatically speeds up training.
+    
+    Expected folder structure:
+        {dataset_path}/{split}/
+            ├── A/          # SAR images
+            ├── B/          # Optical GT
+            ├── C/          # LC label maps
+            └── coarse_rgb/ # Pre-generated from Phase 1 (run pre_generate_coarse.py)
+    
+    Returns:
+        (optical_gt, sar, lc_label, edge_map, coarse_rgb)
+    """
+    
+    def __init__(self, dataset_config, stage='train'):
+        super().__init__()
+        self.image_size = (dataset_config.image_size, dataset_config.image_size)
+        self.stage = stage
+        
+        # Paths
+        dir_a = os.path.join(dataset_config.dataset_path, f'{stage}/A')  # SAR
+        dir_b = os.path.join(dataset_config.dataset_path, f'{stage}/B')  # Optical GT
+        dir_c = os.path.join(dataset_config.dataset_path, f'{stage}/C')  # LC
+        dir_coarse = os.path.join(dataset_config.dataset_path, f'{stage}/coarse_rgb')  # Pre-generated
+        
+        # Check coarse_rgb exists
+        if not os.path.exists(dir_coarse):
+            raise RuntimeError(
+                f"Coarse RGB folder not found: {dir_coarse}\n"
+                f"Please run: python pre_generate_coarse.py --config configs/Template-Refinement.yaml --split {stage}"
+            )
+        
+        # Get image paths
+        image_paths_ori = get_image_paths_from_dir(dir_b)
+        image_paths_sar = get_image_paths_from_dir(dir_a)
+        image_paths_lc = get_image_paths_from_dir(dir_c)
+        image_paths_coarse = get_image_paths_from_dir(dir_coarse)
+        
+        # Align by relative path
+        rel_b = {os.path.relpath(p, dir_b): p for p in image_paths_ori}
+        rel_a = {os.path.relpath(p, dir_a): p for p in image_paths_sar}
+        rel_c = {os.path.relpath(p, dir_c): p for p in image_paths_lc}
+        
+        # For coarse_rgb, use index-based alignment (generated in order)
+        common = sorted(set(rel_b.keys()) & set(rel_a.keys()) & set(rel_c.keys()))
+        
+        if len(common) == 0:
+            raise RuntimeError(f"No aligned samples found for stage={stage}")
+        
+        # Check coarse_rgb count matches
+        if len(image_paths_coarse) != len(common):
+            raise RuntimeError(
+                f"Coarse RGB count mismatch: {len(image_paths_coarse)} vs {len(common)} samples.\n"
+                f"Please regenerate coarse RGB with: python pre_generate_coarse.py --split {stage}"
+            )
+        
+        self.image_paths_ori = [rel_b[k] for k in common]
+        self.image_paths_sar = [rel_a[k] for k in common]
+        self.image_paths_lc = [rel_c[k] for k in common]
+        self.image_paths_coarse = sorted(image_paths_coarse)  # Sorted by filename (000000.png, 000001.png, ...)
+        
+        self.flip = dataset_config.flip if stage == 'train' else False
+        self.to_normal = dataset_config.to_normal
+        
+        # Transforms
+        self.transform = transforms.Compose([
+            transforms.Resize(self.image_size),
+            transforms.ToTensor(),
+        ])
+        self.transform_lc = transforms.Compose([
+            transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor(),
+        ])
+        
+        print(f"[Phase2RefinementDataset] Loaded {len(self)} samples for {stage}")
+    
+    def __len__(self):
+        return len(self.image_paths_ori)
+    
+    def __getitem__(self, i):
+        # Load images
+        img_ori = Image.open(self.image_paths_ori[i]).convert('RGB')
+        img_sar = Image.open(self.image_paths_sar[i]).convert('RGB')
+        img_lc = Image.open(self.image_paths_lc[i]).convert('RGB')
+        img_coarse = Image.open(self.image_paths_coarse[i]).convert('RGB')
+        
+        # Random horizontal flip (apply same flip to all)
+        if self.flip and random.random() > 0.5:
+            img_ori = TF.hflip(img_ori)
+            img_sar = TF.hflip(img_sar)
+            img_lc = TF.hflip(img_lc)
+            img_coarse = TF.hflip(img_coarse)
+        
+        # Transform
+        item_ori = self.transform(img_ori)
+        item_sar = self.transform(img_sar)
+        item_lc = self.transform_lc(img_lc)
+        item_coarse = self.transform(img_coarse)
+        
+        # Normalize to [-1, 1]
+        if self.to_normal:
+            item_ori = (item_ori - 0.5) * 2.0
+            item_sar = (item_sar - 0.5) * 2.0
+            item_coarse = (item_coarse - 0.5) * 2.0
+        
+        # Encode LC to label map
+        label_lc = encode_segmentation_rgb(item_lc)
+        
+        # Extract edge map
+        edge_map = extract_lc_edges(label_lc, min_length=50, dilate_size=0)
+        
+        return item_ori, item_sar, label_lc, edge_map, item_coarse
